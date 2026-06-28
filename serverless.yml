@@ -13,9 +13,9 @@ custom:
     keepOutputDirectory: true
     concurrency: 10
   rds:
-    vpcId: vpc-0370f7d3817b84984
-    subnet1: subnet-02403ccacdf0e3b92
-    subnet2: subnet-07192c54e6cd853da
+    vpcId: ${env:RDS_VPC_ID, "vpc-xxxxxxxxxxxxxxx"}
+    subnet1: ${env:RDS_SUBNET_1, "subnet-xxxxxxxxxxxxxxx"}
+    subnet2: ${env:RDS_SUBNET_2, "subnet-xxxxxxxxxxxxxxx"}
 
 functions:
   dbInit:

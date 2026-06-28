@@ -9,7 +9,7 @@
     "deploy": "serverless deploy",
     "remove": "serverless remove",
     "pretest": "tsc -p tsconfig.json",
-    "test": "jest --passWithNoTests",
+    "test": "jest",
     "test:coverage": "jest --coverage",
     "docs": "redoc-cli bundle ./src/docs/openapi.yaml -o ./docs/swagger.html"
   },

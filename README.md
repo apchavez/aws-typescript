@@ -282,15 +282,15 @@ npm run docs
 ### Prerequisites
 
 1. Configure your AWS credentials (`aws configure` or environment variables).
-2. Update VPC/subnet values in `serverless.yml` → `custom.rds`:
+2. Set the VPC and subnet IDs for the RDS instances as environment variables:
 
-```yaml
-custom:
-  rds:
-    vpcId: vpc-xxxxxxxxxxxxxxx
-    subnet1: subnet-xxxxxxxxxxxxxxx
-    subnet2: subnet-xxxxxxxxxxxxxxx
+```bash
+export RDS_VPC_ID=vpc-xxxxxxxxxxxxxxx
+export RDS_SUBNET_1=subnet-xxxxxxxxxxxxxxx
+export RDS_SUBNET_2=subnet-xxxxxxxxxxxxxxx
 ```
+
+These are read by `serverless.yml` at deploy time via `${env:RDS_VPC_ID}`. No real IDs are committed to the repository.
 
 ### Deploy stack
 
