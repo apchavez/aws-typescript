@@ -1,5 +1,5 @@
 service: clinic-scheduling-platform
-frameworkVersion: "3"
+frameworkVersion: "4"
 
 custom:
   esbuild:
