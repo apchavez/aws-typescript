@@ -21,7 +21,7 @@ This project simulates a production-grade healthcare booking workflow using asyn
 | Relational store | MySQL 8 on RDS (per-country) |
 | Messaging | SNS → SQS fan-out |
 | Event bus | EventBridge |
-| IaC / Deploy | Serverless Framework v3 |
+| IaC / Deploy | Serverless Framework v4 |
 | Local dev | serverless-offline, Docker |
 | Testing | Jest + ts-jest |
 | Docs | OpenAPI / Swagger |
