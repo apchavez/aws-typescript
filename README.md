@@ -1,3 +1,5 @@
+[![CI](https://github.com/apchavez/clinic-scheduling-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/apchavez/clinic-scheduling-platform/actions/workflows/ci.yml)
+
 # Clinic Scheduling Platform
 
 Backend platform for medical appointment scheduling built with **TypeScript**, **AWS Serverless**, and **Clean Architecture**.
@@ -365,7 +367,7 @@ npx serverless logs -f confirmAppointment -t
 
 ---
 
-## GitHub Actions / CI
+## CI/CD
 
 CI runs on every push and pull request to `main`.
 
@@ -416,15 +418,9 @@ The SNS topic ARN is exported as a CloudFormation output (`clinic-scheduling-pla
 
 ---
 
-## Future Improvements
+## Related Projects
 
-- Place worker Lambdas inside the VPC — enables `PubliclyAccessible: false` on RDS and security group restriction to Lambda SG only
-- Integration tests against real AWS resources
-- Notifications (Email / SMS) on appointment confirmation
-
----
-
-## Author
-
-**AP Chavez**  
-Backend Engineer focused on Node.js, TypeScript, AWS, and scalable systems.
+| Project | Description |
+|---|---|
+| [clinic-scheduling-azure](https://github.com/apchavez/clinic-scheduling-azure) | Azure migration of this platform — same domain and Clean Architecture, rewritten in Java 21 on Azure Functions, Cosmos DB, and Service Bus |
+| [event-driven-integration-service](https://github.com/apchavez/event-driven-integration-service) | Serverless integration service on the same TypeScript / AWS Lambda / DynamoDB stack |
