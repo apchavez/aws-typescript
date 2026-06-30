@@ -95,7 +95,8 @@ Failed messages after 3 retries are routed to a Dead Letter Queue (14-day retent
 src/
 ├── api/lambda/
 │   ├── appointment.ts              HTTP handlers (create, list) + SQS confirm handler
-│   └── appointment_country.ts      Country worker (PE + CL via factory pattern)
+│   ├── appointment_country.ts      Country worker (PE + CL via factory pattern)
+│   └── authorizer.ts              HTTP API Lambda Authorizer — JWT validation, SSM secret cache
 ├── app/usecases/
 │   ├── appointment.service.ts      Core booking use case
 │   └── appointment-country.service.ts  Country-specific booking + confirmation use case
@@ -108,10 +109,11 @@ src/
 │   │   ├── IConfirmationBus.ts
 │   │   ├── ICountryBookingRepo.ts
 │   │   └── IMessageBus.ts
-│   └── types.ts                    CountryISO | Status | EventSource
+│   └── types.ts                    CountryISO | Status | EventSource | Role
 ├── infra/
 │   ├── cfn-response.ts             Shared CloudFormation custom resource response helper
 │   ├── config/ddb.ts               DynamoDB document client
+│   ├── jwt.ts                      HS256 JWT sign / verify (timingSafeEqual, base64url)
 │   ├── messaging/
 │   │   ├── eventbridge.service.ts  IConfirmationBus implementation
 │   │   └── sns.service.ts          IMessageBus implementation
@@ -122,7 +124,8 @@ src/
 │   └── secrets-init.ts             CloudFormation custom resource — seeds SSM password
 ├── index.ts                        DI factories (appointmentMakeService, appointmentCountryMakeService)
 └── shared/
-    ├── http.ts                     HTTP response helpers (ok / created / bad / internal)
+    ├── auth.ts                     Lambda Authorizer context extractor (getAuthContext)
+    ├── http.ts                     HTTP response helpers (ok / created / bad / forbidden / internal)
     └── logger.ts                   Structured JSON logger (CloudWatch-compatible)
 postman/
 ├── clean-arch-aws-lambda-typescript.postman_collection.json
@@ -132,7 +135,9 @@ tests/
 ├── appointment.handler.unit.test.ts
 ├── appointment.service.unit.test.ts
 ├── appointment_country.unit.test.ts
-└── appointment-country.service.unit.test.ts
+├── appointment-country.service.unit.test.ts
+├── authorizer.unit.test.ts
+└── jwt.unit.test.ts
 ```
 
 ---
@@ -300,10 +305,12 @@ npm run build
 
 Unit tests cover:
 
-- Lambda handler validation and routing (`appointment.handler.unit.test.ts`)
+- Lambda handler validation, RBAC, and routing (`appointment.handler.unit.test.ts`)
 - Service layer: DynamoDB writes and SNS publish (`appointment.service.unit.test.ts`)
 - Country use case: booking + confirmation, error propagation (`appointment-country.service.unit.test.ts`)
 - Country worker handlers: SQS processing, SNS envelope unwrap, re-throw on failure (`appointment_country.unit.test.ts`)
+- Lambda Authorizer: JWT validation, SSM caching, role and expiry checks (`authorizer.unit.test.ts`)
+- JWT utility: sign/verify round-trip, tamper detection, expiry enforcement (`jwt.unit.test.ts`)
 
 ```bash
 npm test
@@ -413,7 +420,7 @@ See `.github/workflows/ci.yml`.
 - AWS Serverless Framework with CloudFormation custom resources for DB and secrets bootstrap
 - JWT Bearer auth via HTTP API Lambda Authorizer — HS256, `timingSafeEqual`, SSM-backed secret, 300 s result cache
 - Unit testing with mocked AWS SDK clients (`aws-sdk-client-mock`) and plain interface mocks
-- Jest coverage enforcement at 80% threshold across 39 tests in 6 suites
+- Jest coverage enforcement at 80% threshold across 47 tests in 6 suites
 
 ---
 
