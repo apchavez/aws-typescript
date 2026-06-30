@@ -5,7 +5,7 @@ custom:
   esbuild:
     bundle: true
     minify: false
-    sourcemap: false
+    sourcemap: true
     target: node20
     platform: node
     external: []
@@ -361,8 +361,8 @@ resources:
           - Fn::GetAtt: [RdsSecurityGroup, GroupId]
         DBSubnetGroupName:
           Ref: RdsSubnetGroup
-        DeletionProtection: false
-        BackupRetentionPeriod: 0
+        DeletionProtection: true
+        BackupRetentionPeriod: 7
         MultiAZ: false
     RDSCL:
       Type: AWS::RDS::DBInstance
@@ -381,8 +381,8 @@ resources:
           - Fn::GetAtt: [RdsSecurityGroup, GroupId]
         DBSubnetGroupName:
           Ref: RdsSubnetGroup
-        DeletionProtection: false
-        BackupRetentionPeriod: 0
+        DeletionProtection: true
+        BackupRetentionPeriod: 7
         MultiAZ: false
     RDSPEHostParam:
       Type: AWS::SSM::Parameter
