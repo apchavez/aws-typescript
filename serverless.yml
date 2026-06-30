@@ -85,6 +85,9 @@ provider:
   region: us-east-1
   architecture: arm64
   logRetentionInDays: 7
+  tracing:
+    lambda: true
+    apiGateway: true
   httpApi:
     authorizers:
       jwtAuth:
@@ -153,6 +156,11 @@ provider:
         - Effect: Allow
           Action: kms:Decrypt
           Resource: arn:aws:kms:${self:provider.region}:${aws:accountId}:alias/aws/ssm
+        - Effect: Allow
+          Action:
+            - xray:PutTraceSegments
+            - xray:PutTelemetryRecords
+          Resource: "*"
 
 resources:
   Conditions:
