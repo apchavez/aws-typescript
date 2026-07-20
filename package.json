@@ -18,7 +18,7 @@
     "localstack:down": "docker compose -f docker-compose.localstack.yml down -v"
   },
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.1076.0",
+    "@aws-sdk/client-dynamodb": "^3.1091.0",
     "@aws-sdk/client-eventbridge": "^3.1076.0",
     "@aws-sdk/client-sesv2": "^3.1083.0",
     "@aws-sdk/client-sns": "^3.1076.0",
