@@ -1,0 +1,144 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: Deployment stage
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      region:
+        description: AWS region
+        required: true
+        default: us-east-1
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.stage || 'dev' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Bootstrap RDS password SSM parameter
+        run: |
+          if ! aws ssm get-parameter --name /appointments/rds/password --region ${{ inputs.region || 'us-east-1' }} >/dev/null 2>&1; then
+            aws ssm put-parameter \
+              --name /appointments/rds/password \
+              --type SecureString \
+              --key-id alias/aws/ssm \
+              --value "$(openssl rand -hex 20)" \
+              --region ${{ inputs.region || 'us-east-1' }}
+          fi
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Bootstrap JWT secret SSM parameter
+        run: |
+          if ! aws ssm get-parameter --name /appointments/jwt/secret --region ${{ inputs.region || 'us-east-1' }} >/dev/null 2>&1; then
+            aws ssm put-parameter \
+              --name /appointments/jwt/secret \
+              --type SecureString \
+              --key-id alias/aws/ssm \
+              --value "$(openssl rand -hex 32)" \
+              --region ${{ inputs.region || 'us-east-1' }}
+          fi
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Bootstrap Terraform state bucket
+        run: |
+          BUCKET="clinic-scheduling-aws-typescript-tfstate-${{ inputs.stage || 'dev' }}"
+          REGION="${{ inputs.region || 'us-east-1' }}"
+          if ! aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" 2>/dev/null; then
+            if [ "$REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET" --region "$REGION"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" --create-bucket-configuration LocationConstraint="$REGION"
+            fi
+            aws s3api put-bucket-versioning --bucket "$BUCKET" --versioning-configuration Status=Enabled
+            aws s3api put-public-access-block --bucket "$BUCKET" --region "$REGION" --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          fi
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=clinic-scheduling-aws-typescript-tfstate-${{ inputs.stage || 'dev' }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=${{ inputs.region || 'us-east-1' }}"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Terraform apply (VPC, security groups, RDS, VPC endpoints)
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="region=${{ inputs.region || 'us-east-1' }}" \
+            -var="stage=${{ inputs.stage || 'dev' }}"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Capture Terraform outputs
+        id: tf
+        working-directory: terraform
+        run: |
+          set -euo pipefail
+          echo "vpc_id=$(terraform output -raw vpc_id)" >> "$GITHUB_OUTPUT"
+          echo "subnet_1=$(terraform output -json private_subnet_ids | jq -r '.[0]')" >> "$GITHUB_OUTPUT"
+          echo "subnet_2=$(terraform output -json private_subnet_ids | jq -r '.[1]')" >> "$GITHUB_OUTPUT"
+          echo "lambda_sg_id=$(terraform output -raw lambda_security_group_id)" >> "$GITHUB_OUTPUT"
+          echo "rds_host=$(terraform output -raw rds_endpoint)" >> "$GITHUB_OUTPUT"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Clean up orphaned Lambda log groups from a failed prior attempt
+        run: |
+          STACK="clinic-scheduling-platform-${{ inputs.stage || 'dev' }}"
+          if ! aws cloudformation describe-stacks --stack-name "$STACK" --region ${{ inputs.region || 'us-east-1' }} >/dev/null 2>&1; then
+            for lg in $(aws logs describe-log-groups --log-group-name-prefix "/aws/lambda/$STACK-" --region ${{ inputs.region || 'us-east-1' }} --query "logGroups[].logGroupName" --output text); do
+              aws logs delete-log-group --log-group-name "$lg" --region ${{ inputs.region || 'us-east-1' }}
+            done
+          fi
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Deploy
+        run: npx serverless deploy --stage ${{ inputs.stage || 'dev' }} --region ${{ inputs.region || 'us-east-1' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          SERVERLESS_ACCESS_KEY: ${{ secrets.SERVERLESS_ACCESS_KEY }}
+          TF_VPC_ID: ${{ steps.tf.outputs.vpc_id }}
+          TF_SUBNET_1: ${{ steps.tf.outputs.subnet_1 }}
+          TF_SUBNET_2: ${{ steps.tf.outputs.subnet_2 }}
+          TF_LAMBDA_SG_ID: ${{ steps.tf.outputs.lambda_sg_id }}
+          TF_RDS_HOST: ${{ steps.tf.outputs.rds_host }}
