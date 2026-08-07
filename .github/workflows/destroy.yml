@@ -1,0 +1,142 @@
+name: Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: Stage to remove
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      region:
+        description: AWS region
+        required: true
+        default: us-east-1
+        type: string
+      confirm:
+        description: 'Type DELETE to confirm stack removal'
+        required: true
+        type: string
+
+jobs:
+  destroy:
+    name: Remove Serverless stack
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.stage }}
+
+    steps:
+      - name: Validate confirmation
+        if: inputs.confirm != 'DELETE'
+        run: |
+          echo "Confirmation did not match DELETE."
+          exit 1
+
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.region }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=clinic-scheduling-aws-typescript-tfstate-${{ inputs.stage }}" \
+            -backend-config="key=terraform.tfstate" \
+            -backend-config="region=${{ inputs.region }}"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Capture Terraform outputs
+        id: tf
+        working-directory: terraform
+        run: |
+          echo "vpc_id=$(terraform output -raw vpc_id)" >> "$GITHUB_OUTPUT"
+          echo "subnet_1=$(terraform output -json private_subnet_ids | jq -r '.[0]')" >> "$GITHUB_OUTPUT"
+          echo "subnet_2=$(terraform output -json private_subnet_ids | jq -r '.[1]')" >> "$GITHUB_OUTPUT"
+          echo "lambda_sg_id=$(terraform output -raw lambda_security_group_id)" >> "$GITHUB_OUTPUT"
+          echo "rds_host=$(terraform output -raw rds_endpoint)" >> "$GITHUB_OUTPUT"
+
+      - name: Remove stack
+        run: npx serverless remove --stage ${{ inputs.stage }} --region ${{ inputs.region }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          SERVERLESS_ACCESS_KEY: ${{ secrets.SERVERLESS_ACCESS_KEY }}
+          TF_VPC_ID: ${{ steps.tf.outputs.vpc_id }}
+          TF_SUBNET_1: ${{ steps.tf.outputs.subnet_1 }}
+          TF_SUBNET_2: ${{ steps.tf.outputs.subnet_2 }}
+          TF_LAMBDA_SG_ID: ${{ steps.tf.outputs.lambda_sg_id }}
+          TF_RDS_HOST: ${{ steps.tf.outputs.rds_host }}
+
+      - name: Delete orphaned Lambda log groups
+        run: |
+          # CloudFormation never owns these (Lambda auto-creates them on first invoke),
+          # so `serverless remove` leaves them behind as billable orphans.
+          STACK="clinic-scheduling-platform-${{ inputs.stage }}"
+          for lg in $(aws logs describe-log-groups --log-group-name-prefix "/aws/lambda/$STACK-" --region ${{ inputs.region }} --query "logGroups[].logGroupName" --output text); do
+            aws logs delete-log-group --log-group-name "$lg" --region ${{ inputs.region }}
+          done
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Disable RDS deletion protection
+        run: |
+          aws rds modify-db-instance --db-instance-identifier clinic-scheduling-platform --no-deletion-protection --apply-immediately 2>/dev/null || echo "Skipping (not found or already unprotected)"
+          aws rds wait db-instance-available --db-instance-identifier clinic-scheduling-platform 2>/dev/null || true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Wait for Lambda ENIs to detach from the VPC subnets
+        run: |
+          # Lambda-managed ENIs take several minutes to auto-detach after the functions
+          # that used them are deleted (`serverless remove` above) - destroying the
+          # subnets/security groups before that finishes fails with a DependencyViolation.
+          for i in $(seq 1 20); do
+            COUNT=$(aws ec2 describe-network-interfaces \
+              --filters "Name=vpc-id,Values=${{ steps.tf.outputs.vpc_id }}" "Name=interface-type,Values=lambda" \
+              --region ${{ inputs.region }} --query "length(NetworkInterfaces)" --output text 2>/dev/null || echo 0)
+            if [ "$COUNT" = "0" ] || [ "$COUNT" = "None" ]; then
+              echo "No Lambda ENIs remaining."
+              break
+            fi
+            echo "Still $COUNT Lambda ENI(s) attached, waiting 30s (attempt $i/20)..."
+            sleep 30
+          done
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Terraform destroy (VPC, security groups, RDS, VPC endpoints)
+        working-directory: terraform
+        run: |
+          terraform destroy -auto-approve \
+            -var="region=${{ inputs.region }}" \
+            -var="stage=${{ inputs.stage }}"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
