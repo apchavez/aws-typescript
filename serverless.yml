@@ -1,0 +1,451 @@
+service: clinic-scheduling-platform
+frameworkVersion: "4"
+
+build:
+  esbuild: false
+
+custom:
+  esbuild:
+    bundle: true
+    minify: false
+    sourcemap: true
+    target: node20
+    platform: node
+    external: []
+    exclude: []
+    keepOutputDirectory: true
+    concurrency: 10
+  # Network/platform layer (VPC, subnets, security groups, RDS, VPC endpoints) is
+  # provisioned by Terraform (see terraform/) - deploy.yml runs `terraform apply` first
+  # and passes its outputs in as these env vars, replacing what used to be 4 manually
+  # pasted GitHub Secrets (RDS_VPC_ID/RDS_SUBNET_1/RDS_SUBNET_2/RDS_ROUTE_TABLE_ID).
+  network:
+    vpcId: ${env:TF_VPC_ID, "vpc-xxxxxxxxxxxxxxx"}
+    subnet1: ${env:TF_SUBNET_1, "subnet-xxxxxxxxxxxxxxx"}
+    subnet2: ${env:TF_SUBNET_2, "subnet-xxxxxxxxxxxxxxx"}
+    lambdaSecurityGroupId: ${env:TF_LAMBDA_SG_ID, "sg-xxxxxxxxxxxxxxx"}
+    rdsHost: ${env:TF_RDS_HOST, "tf-outputs-not-set.invalid"}
+
+functions:
+  authorize:
+    handler: src/api/lambda/authorizer.handler
+    memorySize: 128
+    timeout: 5
+  dbInit:
+    handler: src/infra/db-init.handler
+    timeout: 300
+    memorySize: 256
+    # Must run inside the VPC: RDS is not publicly accessible and its
+    # security group only allows inbound MySQL from LambdaSecurityGroup.
+    vpc:
+      securityGroupIds:
+        - ${self:custom.network.lambdaSecurityGroupId}
+      subnetIds:
+        - ${self:custom.network.subnet1}
+        - ${self:custom.network.subnet2}
+  secretsInit:
+    handler: src/infra/secrets-init.handler
+    timeout: 60
+    memorySize: 256
+  createAppointment:
+    handler: src/api/lambda/appointment.createAppointment
+    events:
+      - httpApi:
+          path: /appointments
+          method: post
+          authorizer:
+            name: jwtAuth
+  listByInsured:
+    handler: src/api/lambda/appointment.listByInsured
+    events:
+      - httpApi:
+          path: /appointments/{insuredId}
+          method: get
+          authorizer:
+            name: jwtAuth
+  getAppointmentHistory:
+    handler: src/api/lambda/appointment.getAppointmentHistory
+    events:
+      - httpApi:
+          path: /appointments/{appointmentUuid}/history
+          method: get
+          authorizer:
+            name: jwtAuth
+  health:
+    handler: src/api/lambda/health.handler
+    events:
+      - httpApi:
+          path: /health
+          method: get
+  confirmAppointment:
+    handler: src/api/lambda/appointment.confirmAppointment
+    events:
+      - sqs:
+          arn: { Fn::GetAtt: [ConfirmationsQueue, Arn] }
+          batchSize: 10
+  appointmentCountry:
+    handler: src/api/lambda/appointment_country.handler
+    environment:
+      RDS_HOST: ${self:custom.network.rdsHost}
+      # Fetched by SecretsInitCustom (not VPC-bound, has normal internet access) and
+      # passed through via Fn::GetAtt - {{resolve:ssm-secure:...}} dynamic references
+      # are only supported in a narrow allowlist of properties (RDS MasterUserPassword
+      # among them) and are rejected here with a stack-wide validation error.
+      RDS_PASSWORD:
+        Fn::GetAtt: [SecretsInitCustom, value]
+    events:
+      - sqs:
+          arn: { Fn::GetAtt: [SQSCountry, Arn] }
+          batchSize: 10
+    timeout: 30
+    memorySize: 512
+    # This handler's EventBridgeConfirmationBus.publish (PutEvents) call reaches the
+    # events API via the EventBridge Interface VPC Endpoint (terraform/vpc_endpoints.tf)
+    # - a real runtime call, not a resolvable secret, so it needs its own route out of
+    # the VPC.
+    vpc:
+      securityGroupIds:
+        - ${self:custom.network.lambdaSecurityGroupId}
+      subnetIds:
+        - ${self:custom.network.subnet1}
+        - ${self:custom.network.subnet2}
+
+plugins:
+  - serverless-esbuild
+  - serverless-offline
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: us-east-1
+  architecture: arm64
+  logRetentionInDays: 7
+  tracing:
+    lambda: true
+    apiGateway: true
+  httpApi:
+    throttle:
+      burstLimit: 50
+      rateLimit: 25
+    authorizers:
+      jwtAuth:
+        type: request
+        functionName: authorize
+        enableSimpleResponses: true
+        identitySource: $request.header.Authorization
+        resultTtlInSeconds: 300
+  environment:
+    TABLE_APPOINTMENTS: { Ref: AppointmentsTable }
+    TABLE_APPOINTMENT_EVENTS: { Ref: AppointmentEventsTable }
+    # Optional: SES requires a verified sender identity (email or domain). Left unset by
+    # default so the NoOp notifier is used until an identity is verified - notifications are
+    # best-effort and never block the appointment lifecycle either way.
+    SES_SENDER_ADDRESS: ${env:SES_SENDER_ADDRESS, ''}
+    JWT_SECRET_SSM: /appointments/jwt/secret
+    RDS_HOST_SSM: /appointments/rds/host
+    RDS_PASSWORD_SSM: /appointments/rds/password
+    RDS_PORT: "3306"
+    RDS_DATABASE: appointments
+    RDS_USER: admin
+    SNS_APPOINTMENTS_ARN: { Ref: AppointmentTopic }
+    EB_BUS_NAME: { Ref: AppointmentBus }
+    SQS_COUNTRY_URL: { Ref: SQSCountry }
+    SQS_COUNTRY_ARN: { Fn::GetAtt: [SQSCountry, Arn] }
+    CONFIRMATIONS_SQS_URL: { Ref: ConfirmationsQueue }
+    CONFIRMATIONS_SQS_ARN: { Fn::GetAtt: [ConfirmationsQueue, Arn] }
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:Query
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+          Resource:
+            - Fn::GetAtt: [AppointmentsTable, Arn]
+            - Fn::Join:
+                - "/"
+                - - Fn::GetAtt: [AppointmentsTable, Arn]
+                  - index
+                  - byInsured
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:Query
+            - dynamodb:DescribeTable
+          Resource:
+            - Fn::GetAtt: [AppointmentEventsTable, Arn]
+        - Effect: Allow
+          Action: ses:SendEmail
+          Resource: arn:aws:ses:${self:provider.region}:${aws:accountId}:identity/*
+        - Effect: Allow
+          Action: sns:Publish
+          Resource: { Ref: AppointmentTopic }
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource:
+            - Fn::GetAtt: [SQSCountry, Arn]
+            - Fn::GetAtt: [ConfirmationsQueue, Arn]
+        - Effect: Allow
+          Action: events:PutEvents
+          Resource:
+            Fn::GetAtt: [AppointmentBus, Arn]
+        - Effect: Allow
+          Action:
+            - ssm:GetParameter
+            - ssm:PutParameter
+          Resource:
+            - arn:aws:ssm:${self:provider.region}:${aws:accountId}:parameter/appointments/rds/*
+            - arn:aws:ssm:${self:provider.region}:${aws:accountId}:parameter/appointments/jwt/*
+        - Effect: Allow
+          Action: kms:Decrypt
+          Resource: arn:aws:kms:${self:provider.region}:${aws:accountId}:alias/aws/ssm
+        - Effect: Allow
+          Action:
+            - xray:PutTraceSegments
+            - xray:PutTelemetryRecords
+          Resource: "*"
+
+resources:
+  Conditions:
+    HasAlarmEmail: !Not
+      - !Equals
+          - "${env:ALARM_EMAIL, ''}"
+          - ""
+  Resources:
+    HttpApiStage:
+      Type: AWS::ApiGatewayV2::Stage
+      Properties:
+        ApiId: !Ref HttpApi
+        StageName: $default
+        AutoDeploy: true
+        DefaultRouteSettings:
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 25
+    AppointmentsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: Appointments
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: appointmentUuid
+            AttributeType: S
+          - AttributeName: insuredId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: appointmentUuid
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: byInsured
+            KeySchema:
+              - AttributeName: insuredId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+    AppointmentEventsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: AppointmentEvents
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: appointmentUuid
+            AttributeType: S
+          - AttributeName: sortKey
+            AttributeType: S
+        KeySchema:
+          - AttributeName: appointmentUuid
+            KeyType: HASH
+          - AttributeName: sortKey
+            KeyType: RANGE
+    AppointmentTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: appointmentTopic
+        KmsMasterKeyId: alias/aws/sns
+    SQSCountryDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: appointments-country-dlq
+        MessageRetentionPeriod: 1209600
+        SqsManagedSseEnabled: true
+    SQSCountry:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: appointments-country
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt SQSCountryDLQ.Arn
+          maxReceiveCount: 3
+        SqsManagedSseEnabled: true
+    TopicSubscriptionCountry:
+      Type: AWS::SNS::Subscription
+      Properties:
+        Protocol: sqs
+        TopicArn: { Ref: AppointmentTopic }
+        Endpoint: { Fn::GetAtt: [SQSCountry, Arn] }
+        RawMessageDelivery: true
+    SQSPolicyCountry:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues: [{ Ref: SQSCountry }]
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal: { Service: sns.amazonaws.com }
+              Action: sqs:SendMessage
+              Resource: { Fn::GetAtt: [SQSCountry, Arn] }
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: { Ref: AppointmentTopic }
+    AppointmentBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: appointments-bus
+    ConfirmationsDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: appointments-confirmaciones-dlq
+        MessageRetentionPeriod: 1209600
+        SqsManagedSseEnabled: true
+    ConfirmationsQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: appointments-confirmaciones
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt ConfirmationsDLQ.Arn
+          maxReceiveCount: 3
+        SqsManagedSseEnabled: true
+    EventRuleToSQS:
+      Type: AWS::Events::Rule
+      Properties:
+        EventBusName: { Ref: AppointmentBus }
+        EventPattern:
+          source: [appointment-service]
+          detail-type: [AppointmentConfirmed]
+        Targets:
+          - Arn: { Fn::GetAtt: [ConfirmationsQueue, Arn] }
+            Id: ToConfirmationsQueueTarget
+    AllowEventBridgeToSQS:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues: [{ Ref: ConfirmationsQueue }]
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal: { Service: events.amazonaws.com }
+              Action: sqs:SendMessage
+              Resource: { Fn::GetAtt: [ConfirmationsQueue, Arn] }
+    SecretsInitCustom:
+      Type: Custom::PasswordToSSM
+      Properties:
+        ServiceToken: { Fn::GetAtt: [SecretsInitLambdaFunction, Arn] }
+        PasswordParamName: /appointments/rds/password
+    JwtSecretInit:
+      Type: Custom::PasswordToSSM
+      Properties:
+        ServiceToken: { Fn::GetAtt: [SecretsInitLambdaFunction, Arn] }
+        PasswordParamName: /appointments/jwt/secret
+    DbInit:
+      Type: Custom::DbInit
+      Properties:
+        ServiceToken: { Fn::GetAtt: [DbInitLambdaFunction, Arn] }
+        Action: initDbTables
+        Host: ${self:custom.network.rdsHost}
+        Db: ${self:provider.environment.RDS_DATABASE}
+        User: ${self:provider.environment.RDS_USER}
+        Password:
+          Fn::GetAtt: [SecretsInitCustom, value]
+      DependsOn:
+        - SecretsInitCustom
+    RdsMasterSecret:
+      Type: AWS::SecretsManager::Secret
+      Properties:
+        GenerateSecretString:
+          SecretStringTemplate: '{"username":"admin"}'
+          GenerateStringKey: password
+          PasswordLength: 20
+          ExcludeCharacters: '"@/\'
+
+    # ── Observability: DLQ depth alarms ────────────────────────────────────────
+    AlarmsTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-alarms
+        KmsMasterKeyId: alias/aws/sns
+
+    AlarmsTopicPolicy:
+      Type: AWS::SNS::TopicPolicy
+      Properties:
+        Topics:
+          - !Ref AlarmsTopic
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: cloudwatch.amazonaws.com
+              Action: sns:Publish
+              Resource: !Ref AlarmsTopic
+
+    AlarmsEmailSubscription:
+      Type: AWS::SNS::Subscription
+      Condition: HasAlarmEmail
+      Properties:
+        Protocol: email
+        TopicArn: !Ref AlarmsTopic
+        Endpoint: "${env:ALARM_EMAIL, ''}"
+
+    DlqAlarmCountry:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-country-dlq-depth
+        AlarmDescription: "Messages in the country-booking DLQ — failed appointment processing"
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt SQSCountryDLQ.QueueName
+        Statistic: Maximum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions:
+          - !Ref AlarmsTopic
+        OKActions:
+          - !Ref AlarmsTopic
+
+    DlqAlarmConfirmations:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-confirmations-dlq-depth
+        AlarmDescription: "Messages in Confirmations DLQ — failed status update in DynamoDB"
+        Namespace: AWS/SQS
+        MetricName: ApproximateNumberOfMessagesVisible
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt ConfirmationsDLQ.QueueName
+        Statistic: Maximum
+        Period: 60
+        EvaluationPeriods: 1
+        Threshold: 0
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        AlarmActions:
+          - !Ref AlarmsTopic
+        OKActions:
+          - !Ref AlarmsTopic
+
+  Outputs:
+    AlarmsTopicArn:
+      Description: "SNS topic for DLQ alarms — subscribe via CLI: aws sns subscribe --topic-arn <arn> --protocol email --notification-endpoint <email>"
+      Value: !Ref AlarmsTopic
+      Export:
+        Name: ${self:service}-alarms-topic-arn
